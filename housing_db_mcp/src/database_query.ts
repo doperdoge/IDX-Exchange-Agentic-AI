@@ -58,6 +58,51 @@ server.registerTool(
     }
 )
 
+server.registerTool(
+    "session_memory",
+    {
+        description: "Maintain session information and ask follow ups on missing information",
+        inputSchema: z.object({
+            request: z.string().min(1),
+        }),
+    },
+    async ({request}) => {
+        const filters = await parsePropertyQuery(request);
+        const entry: Partial<UserSession> = {};
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        }
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        }
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        }
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        }
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        }
+        if (filters.baths != null) {
+            entry.baths = filters.baths
+        } 
+
+        updateSession("user", entry);
+        const curr_session = getSession("user")
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify({curr_session})
+                }
+            ]
+        }
+    }
+)
+
+
+//___________________________________Handle and Parse User Query____________________________________
 export async function query<T>(sql: string, params: any[] = []): Promise<T[]> {
     const [rows] = await pool.execute(sql, params);
     return rows as T[];
@@ -209,6 +254,37 @@ interface SoldRow {
     BuyerOfficeName: string
 }
 
+//______________________________________Session Memory____________________________________
+interface UserSession {
+  city?: string | null;
+  maxPrice?: number | null;
+  beds?: number | null;
+  baths?: number | null;
+  type?: string | null;
+  pool?: string | null;
+  lastResults?: ListingRow[];
+  conversationStep: number;
+}
+
+const sessions = new Map<string, UserSession>();
+export function getSession(userId: string): UserSession {
+  if (!sessions.has(userId)) {
+    sessions.set(userId, { conversationStep: 0 });
+  }
+  return sessions.get(userId)!;
+}
+
+export function updateSession(userId: string, updates: Partial<UserSession>) {
+  const session = getSession(userId);
+  sessions.set(userId, { ...session, ...updates });
+}
+
+export function clearSession(userId: string) {
+  sessions.delete(userId);
+}
+
+
+//_____________________________________Start Server____________________________________________
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
