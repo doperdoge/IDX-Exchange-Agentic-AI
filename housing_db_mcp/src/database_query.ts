@@ -88,6 +88,9 @@ server.registerTool(
             entry.baths = filters.baths
         } 
 
+        //get all usersession info pass to string 
+        //parse property query
+        
         updateSession("user", entry);
         const curr_session = getSession("user")
         return {
