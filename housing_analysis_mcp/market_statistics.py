@@ -1,9 +1,9 @@
 import os
 import pandas as pd
 import mysql.connector
-from sqlalchemy import create_engine, URL
+from sqlalchemy import create_engine, URL, text
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
 import numpy as np
 from mcp.server import MCPServer
 
@@ -48,26 +48,12 @@ def get_price_trend(city: str, months: int = 24):
 
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-client = OpenAI()
+client = genai.Client()
 
-# connection = mysql.connector.connect(
-#     user = os.environ["MYSQL_USER"],
-#     password = os.environ["MYSQL_PASSWORD"],
-#     host = os.environ["MYSQL_HOST"],
-#     port = os.environ["MYSQL_PORT"],
-#     database = os.environ["MYSQL_DATABASE"]
-# )
-
-# # creates a way to pass calls to the sql database 
-# cursor = connection.cursor(dictionary=True)
-
-# # retrieves all rows and stores each row as a map with the column being the key
-# cursor.execute("SELECT * FROM rets_property")
-
-def get_embedding(text: str, model="text-embedding-3-small") -> list[float]:
+def get_embedding(text: str, model="gemini-embedding-001") -> list[float]:
     text = text.replace("\n", " ").strip()[:8000]  # max token safety
-    response = client.embeddings.create(model=model, input=text)
-    return response.data[0].embedding
+    response = client.models.embed_content(model=model, contents=text)
+    return response.embeddings[0].values
 # Build embedding for a listing (combine key fields)
 
 def build_listing_embedding(row: dict) -> list[float]:
@@ -83,8 +69,13 @@ def build_listing_embedding(row: dict) -> list[float]:
 #builds the listing embeddings for find_similar_listings
 def build_all_embeddings():
     embeddings = []
-    for row in cursor:
-        embeddings.append((row["L_ListingID"], build_listing_embedding(row)))
+    with engine.connect() as connection:
+        result = connection.execution_options(
+            stream_results=True
+        ).execute(text("SELECT * from rets_property"))
+
+        for row in result.mappings():
+            embeddings.append((row["L_ListingID"], build_listing_embedding(row)))
     return embeddings
 
 from sklearn.metrics.pairwise import cosine_similarity
@@ -108,7 +99,55 @@ def vector_embedding_search(query, top_k):
     embeddings = build_all_embeddings()
     return find_similar_listings(query, embeddings, top_k)
 
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+def calculate_similarity_score(
+    target: dict,
+    candidate: dict,
+    target_emb: list[float],
+    candidate_emb: list[float]
+) -> float:
+    score = 0.0
+    # Structured similarity (60% of total score)
+    price_diff = abs(target["L_SystemPrice"] - candidate["L_SystemPrice"])
+    if price_diff < 50_000:   score += 20
+    elif price_diff < 150_000: score += 12
+    elif price_diff < 300_000: score += 5
+    if target["L_Keyword2"] == candidate["L_Keyword2"]:       score += 15
+    if target["L_City"]     == candidate["L_City"]:           score += 15
+    sqft_diff = abs(target["LM_Int2_3"] - candidate["LM_Int2_3"])
+    if sqft_diff < 300:  score += 10
+    elif sqft_diff < 700: score += 5
+    # Semantic similarity (40% of total score)
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+    sem_sim = cosine_similarity(
+        np.array(target_emb).reshape(1,-1),
+        np.array(candidate_emb).reshape(1,-1)
+    )[0][0]
+    score += sem_sim * 40
+    return round(score, 2)
+
+# Check if recommended price is supported by recent comps
+def validate_with_comps(city: str, sqft: int, price: int) -> dict:
+    sql = """
+        SELECT
+          AVG(ClosePrice / NULLIF(LivingArea,0)) AS avg_ppsf,
+          COUNT(*) AS comp_count
+        FROM california_sold
+        WHERE City = %s AND PropertyType = 'Residential'
+          AND LivingArea BETWEEN %s AND %s
+          AND CloseDate >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+    """
+    result = query(sql, [city, sqft * 0.8, sqft * 1.2])
+    avg_ppsf = result[0]["avg_ppsf"] or 0
+    comp_price = avg_ppsf * sqft
+    return {
+        "comp_price":  round(comp_price),
+        "list_price":  price,
+        "comp_count":  result[0]["comp_count"],
+        "delta_pct":   round((price - comp_price) / comp_price * 100, 1)
+    }
 
 #start the server
 if __name__ == "__main__":
