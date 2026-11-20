@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from google import genai
 import numpy as np
 from mcp.server import MCPServer
+from sklearn.metrics.pairwise import cosine_similarity
 
 mcp = MCPServer("housing_analysis_tool")
 
@@ -54,31 +55,6 @@ def get_embedding(text: str, model="gemini-embedding-001") -> list[float]:
     text = text.replace("\n", " ").strip()[:8000]  # max token safety
     response = client.models.embed_content(model=model, contents=text)
     return response.embeddings[0].values
-# Build embedding for a listing (combine key fields)
-
-def build_listing_embedding(row: dict) -> list[float]:
-    text = f"""
-        {row["L_Type_"]} in {row["L_City"]}, CA.
-        {row["L_Keyword2"]} beds, {row["LM_Dec_3"]} baths.
-        {row["LM_Int2_3"]} sq ft. Built {row["YearBuilt"]}.
-        Price: ${row["L_SystemPrice"]:,}.
-        {row.get("L_Remarks", "")}
-    """.strip()
-    return get_embedding(text)
-
-#builds the listing embeddings for find_similar_listings
-def build_all_embeddings():
-    embeddings = []
-    with engine.connect() as connection:
-        result = connection.execution_options(
-            stream_results=True
-        ).execute(text("SELECT * from rets_property"))
-
-        for row in result.mappings():
-            embeddings.append((row["L_ListingID"], build_listing_embedding(row)))
-    return embeddings
-
-from sklearn.metrics.pairwise import cosine_similarity
 
 def find_similar_listings(
     query: str,
@@ -96,8 +72,16 @@ def find_similar_listings(
 
 @mcp.tool()
 def vector_embedding_search(query, top_k):
-    embeddings = build_all_embeddings()
+    with engine.connect() as connection:
+        result = connection.execution_options(stream_results=True).execute(text("SELECT source_id, embedding from row_embeddings").columns(embedding=JSON()))
+
+        embeddings = [
+            (str(row.source_id), row.embedding)
+            for row in result
+        ]
+
     return find_similar_listings(query, embeddings, top_k)
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -148,6 +132,50 @@ def validate_with_comps(city: str, sqft: int, price: int) -> dict:
         "comp_count":  result[0]["comp_count"],
         "delta_pct":   round((price - comp_price) / comp_price * 100, 1)
     }
+
+# --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# 1. Chunk documents
+def chunk_text(text: str, chunk_size=600, overlap=100) -> list[str]:
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+# 2. Index chunks
+def index_documents(docs: list[dict]) -> list[dict]:
+    indexed = []
+    for doc in docs:
+        for chunk in chunk_text(doc["content"]):
+            indexed.append({
+                "source": doc["title"],
+                "chunk":  chunk,
+                "embedding": get_embedding(chunk)
+            })
+    return indexed
+
+# 3. Retrieve relevant chunks for a query
+def retrieve(query: str, index: list[dict], top_k=4) -> list[dict]:
+    q_emb = np.array(get_embedding(query)).reshape(1,-1)
+    scored = [
+        (doc, cosine_similarity(q_emb, np.array(doc["embedding"]).reshape(1,1))[0][0])
+        for doc in index
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in scored[:top_k]]
+
+# 4. Generate grounded answer
+def rag_answer(query: str, index: list[dict]) -> str:
+    chunks = retrieve(query, index)
+    context = "\n\n".join(c["chunk"] for c in chunks)
+    prompt = f"Answer using only the context below:\n\n{context}\n\nQuestion: {query}"
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content
 
 #start the server
 if __name__ == "__main__":
